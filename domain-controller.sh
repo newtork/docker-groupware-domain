@@ -3,9 +3,9 @@
 #description     : This script acts as a STDIN/STDOUT wrapper and provides additional arguments to the server startup routine.
 #author          : newtork / Alexander Dümont
 #date            : 2016-10-17
-#version         : 0.1
-#usage           : bash openttd.wrapper.sh help [TODO]
-#notes           : required to run inside docker image "newtork/groupware-domain"
+#version         : 0.1a
+#usage           : bash domain-controller.sh help
+#notes           : recommended to be run inside docker image "newtork/groupware-domain"
 #bash_version    : 4.3.42(3)-release
 #==============================================================================
 
@@ -55,7 +55,7 @@ while getopts ":d:s:n:p:e:l:" opt; do
 done
 
 if [ "$1" == "help" ]; then
-	echo "Usage: `` 
+	echo "Usage: 
 		-d DOMAIN_PATH
 		-s DOMAIN_NAME
 		-n DOMAIN_FQN
@@ -74,13 +74,17 @@ fi
 
 # trap function to execute commands after CTRL-C
 savelyexit() {
+	echo ""
 	for service in samba smbd winbindd named; do
 		if pgrep "$service" > /dev/null; then
 			pkill "$service"
 			echo "Exited $service."
 		fi
 	done 
-
+	
+	unlink /var/lib/samba/private/ > /dev/null 2&>1
+	unlink /etc/samba/smb.conf > /dev/null 2&>1
+	
 	# sleep for short period of time to let trap quit smoothly
 	sleep 1
 	exit 0
@@ -96,8 +100,10 @@ else
 		echo "Warning: Path for active directory was not empty."
 	fi
 
-	mkdir -p $par_path
-	rm -rf $par_path
+	# clear samba path
+	mkdir -p $par_path && rm -rf $par_path/*
+	
+	# clear default configuration
 	rm -f /etc/samba/smb.conf
 	
 	# provision new domain
@@ -112,24 +118,25 @@ else
 		--option="bind interfaces only=yes" \
 		--use-xattrs=yes \
 		--targetdir=$par_path
-		
-	
-	# fix bind9, add configuration for samba
-	printf "Include \"$par_path/private/named.conf\";\n" >> /etc/bind/named.conf
-	DIRECTORY_ESCAPED=$(sed 's/\//\\\//g' <<< $par_path) && \
-	sed -i "s/^};$/tkey-gssapi-keytab \"$DIRECTORY_ESCAPED\/private\/dns.keytab\";\n};/" /etc/bind/named.conf.options
-
-	# fix bind9, file mappings for samba
-	cp /var/lib/samba/private/passdb.tdb $par_path/private/
-	mv /var/lib/samba/private/ /var/lib/samba/private.bak
-	
-	# -> replace kerberos configuration
-	cp $par_path/private/krb5.conf /etc/krb5.conf
 fi
 
+# fix bind9, add configuration for samba
+if ! grep "private/named.conf" /etc/bind/named.conf > /dev/null; then
+	printf "Include \"$par_path/private/named.conf\";\n" >> /etc/bind/named.conf
+fi
+if ! grep "tkey-gssapi-keytab" /etc/bind/named.conf.options > /dev/null; then
+	DIRECTORY_ESCAPED=$(sed 's/\//\\\//g' <<< $par_path)
+	sed -i "s/^};$/tkey-gssapi-keytab \"$DIRECTORY_ESCAPED\/private\/dns.keytab\";\n};/" /etc/bind/named.conf.options
+fi
+
+# replace kerberos configuration, no link needed
+cp $par_path/private/krb5.conf /etc/krb5.conf
+
+# remove old/default samba config files
+unlink /var/lib/samba/private/ > /dev/null 2&>1 || rm -rf /var/lib/samba/private/
+unlink /etc/samba/smb.conf > /dev/null 2&>1 || rm -f /etc/samba/smb.conf
+
 # fix samba private dir and smb config file
-rm -rf /var/lib/samba/private
-rm -f /etc/samba/smb.conf
 ln -s $par_path/private/ /var/lib/samba/private
 ln -s $par_path/etc/smb.conf /etc/samba/smb.conf
 
@@ -156,10 +163,10 @@ fi
 
 # start programs
 echo "Info: Starting Samba (Active Directory)..."
-samba
+service samba start
 
-echo "Info: Starting Named (DNS-Server)..."
-named
+echo "Info: Starting Bind9/Named (DNS-Server)..."
+service bind9 start && named
 
 # fix active directory self ip 
 sleep 1
@@ -167,13 +174,13 @@ sleep 1
 # -> clear old ip mapping
 echo "Clearing old IP mapping from DNS."
 ifconfig | awk '/inet addr/{print substr($2,6)}' | while read line; do
-	echo $par_passwd | samba-tool dns delete 127.0.0.1 $par_fqn $HOSTNAME A $line -UAdministrator
+	samba-tool dns delete 127.0.0.1 $par_fqn $HOSTNAME A $line -UAdministrator --password=$par_passwd > /dev/null 2&>1
 done
 
 # -> add current ip mapping
 echo "Adding current IP mapping to DNS."
-echo $par_passwd | samba-tool dns add 127.0.0.1 $par_fqn . A $par_ip -UAdministrator
-echo $par_passwd | samba-tool dns add 127.0.0.1 $par_fqn $HOSTNAME A $par_ip -UAdministrator
+samba-tool dns add 127.0.0.1 $par_fqn . A $par_ip -UAdministrator --password=$par_passwd > /dev/null 2&>1
+samba-tool dns add 127.0.0.1 $par_fqn $HOSTNAME A $par_ip -UAdministrator --password=$par_passwd > /dev/null 2&>1
 
 
 
@@ -192,10 +199,66 @@ running() {
 sleep 1
 if running; then
 	echo "Started."
+	echo "Type \"help\" to list commands."
 
 	# read from stdin and redirect to fifo pipe while server is running
-	while read line && running
-	do echo "TODO: $line"
+	printf "\n> "
+	while read line && running; do
+		if [ "$line" == "help" ]; then
+			printf "\nYou can use the following commands to monitor the active directory: 
+	host    Check dns lookup for the active directory.
+	data    Check the samba active directory database.
+	samba   Display local samba network shares.
+	proc    Display running processes of the domain controller.
+	ports   Display port usage of the domain controller.
+	build   Display samba build options.
+	repl    Display replication status.
+	exit    Shutdown the domain controller.\n";
+				
+		elif [ "$line" == "host" ]; then
+			printf "\nLooking for LDAP in domain...\n"
+			host -t SRV _ldap._tcp.$par_fqn.
+			printf "\nLooking for Kerberos in domain...\n"
+			host -t SRV _kerberos._udp.$par_fqn.
+			printf "\nLooking for this computer in domain...\n"
+			host -t A $HOSTNAME.$par_fqn.;
+			
+		elif [ "$line" == "data" ]; then
+			printf "\nChecking samba database...\n"
+			samba-tool dbcheck;
+			
+		elif [ "$line" == "samba" ]; then
+			printf "\nLooking for samba root shares in domain...\n"
+			smbclient -L localhost -U%;
+			
+		elif [ "$line" == "proc" ]; then
+			printf "\nListing running samba processes...\n"
+			ps axf | egrep "samba|smbd|winbindd|named";
+			
+		elif [ "$line" == "ports" ]; then
+			printf "\nListing samba port usages...\n"
+			netstat -tulpn | egrep "samba|smbd|named";
+			
+		elif [ "$line" == "build" ]; then
+			printf "\nListing samba build options...\n" 
+			smbd -b;
+			
+		elif [ "$line" == "repl" ]; then
+			printf "\nChecking DNS Replication...\n"
+			samba-tool drs showrepl;
+			
+		elif [ "$line" == "exit" ]; then
+			break;
+			
+		elif [ "$line" == "" ]; then
+			printf "> "
+			continue;
+		
+		else
+			printf "\nUnknown command: $line\nType \"help\" to list commands.\n"
+		fi
+	
+	printf "\n> "
 	done < /dev/stdin
 
 fi
